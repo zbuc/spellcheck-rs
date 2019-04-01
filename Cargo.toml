@@ -1,0 +1,16 @@
+[package]
+name = "python_rust_test"
+version = "0.1.0"
+authors = ["Chris Czub <chris.czub@groundspeed.com>"]
+edition = "2018"
+
+[lib]
+name = "python_rust_test"
+crate-type = ["cdylib"]
+
+[dependencies.pyo3]
+version = "0.6.0-alpha.4"
+features = ["extension-module"]
+
+[dependencies]
+fasthash = "0.4"
