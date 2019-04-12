@@ -14,23 +14,48 @@ fn hash<T: Hash +std::convert::AsRef<[u8]>>(t: &T, seed: u32) -> u128 {
     murmur3::hash128_with_seed(t, seed)
 }
 
-#[pyfunction]
-/// Formats the sum of two numbers as string
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a+b).to_string())
-}
-
 /// This module is a python module implemented in Rust
 #[pymodule]
-fn string_sum(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_wrapped(wrap_pyfunction!(sum_as_string))?;
+fn bloomfilter(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<PyBloomFilter>()?;
 
     Ok(())
 }
 
+#[pyclass]
+pub struct PyBloomFilter {
+    bf: BloomFilter,
+}
+
+#[pymethods]
+impl PyBloomFilter {
+    #[new]
+    pub fn new(obj: &PyRawObject, max_capacity: usize, target_error_rate: f64) {
+        obj.init(PyBloomFilter {
+            bf: BloomFilter::new(max_capacity, target_error_rate),
+        });
+    }
+
+    /// Adds an element to an existing BloomFilter from Python
+    fn add(&mut self, item: String) -> PyResult<bool> {
+        self.bf.add(item.as_bytes());
+        Ok(true)
+    }
+
+    /// Checks for an element in an existing BloomFilter from Python
+    fn check_existence(&self, item: String) -> PyResult<bool> {
+        Ok(self.bf.check_existence(item.as_bytes()))
+    }
+
+    /// Returns the error rate of the BloomFilter as configured from Python
+    fn error_rate(&self) -> PyResult<f64> {
+        Ok(self.bf.error_rate())
+    }
+}
+
 // https://codeburst.io/lets-implement-a-bloom-filter-in-go-b2da8a4b849f
 pub struct BloomFilter {
-    pub bitset: Vec<bool>, // probably want a fixed-size allocation here
+    pub bitset: Vec<bool>, // probably want this on the stack -- also the size of bool is 1 byte, we could use a bitfield instead
     pub k: usize, // the number of hash values
     pub n: usize, // the number of elements in the filter
     pub m: usize, // size of the bloom filter bitset
@@ -39,19 +64,22 @@ pub struct BloomFilter {
     // but for simplicity and efficiency, we'll *always* use murmur3
     // and we only need to store the seeds
     // https://play.rust-lang.org/?code=trait%20Barable%20%7B%0A%20%20%20%20fn%20new()%20-%3E%20Self%3B%0A%20%20%20%20%2F%2F%20etc.%0A%7D%0A%0Astruct%20Bar%3B%0A%0Aimpl%20Barable%20for%20Bar%20%7B%0A%20%20%20%20fn%20new()%20-%3E%20Self%20%7B%0A%20%20%20%20%20%20%20%20Bar%0A%20%20%20%20%7D%0A%7D%0A%0Astruct%20Foo%3CB%20%3ABarable%3E%20%7B%0A%20%20%20%20bar%3A%20B%2C%0A%20%20%20%20callback%3A%20fn(%26B)%2C%0A%7D%0A%0Aimpl%3CB%3A%20Barable%3E%20Foo%3CB%3E%20%7B%0A%20%20%20%20fn%20new(callback%3A%20fn(%26B))%20-%3E%20Self%20%7B%0A%20%20%20%20%20%20%20%20Foo%7B%0A%20%20%20%20%20%20%20%20%20%20%20%20bar%3A%20B%3A%3Anew()%2C%0A%20%20%20%20%20%20%20%20%20%20%20%20callback%3A%20callback%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%7D%0A%7D%0A%0Afn%20example_callback(bar%3A%20%26Bar)%20%7B%0A%7D%0A%0Afn%20main()%20%7B%0A%20%20%20%20let%20foo%20%3D%20Foo%3A%3Anew(example_callback)%3B%0A%7D&version=stable&backtrace=0
-    pub murmur3_seeds: Vec<u32>,
+    pub murmur3_seeds: Vec<usize>,
 }
 
 // All of the Vecs here are heap-allocated. We might speed things up by
 // putting them on the stack.
 impl BloomFilter {
-    pub fn new(size: usize) -> Self {
+    pub fn new(max_capacity: usize, target_error_rate: f64) -> Self {
+        let bitset_size = BloomFilter::optimal_bitset_size(max_capacity, target_error_rate);
+        let num_hashfuncs = BloomFilter::hashfunctions_needed(bitset_size, max_capacity);
+
         BloomFilter {
-            bitset: vec![false; size],
-            k: 5, // hardcoded at 5 functions for now -- check error_rate XXX
-            m: size,
+            bitset: vec![false; bitset_size],
+            k: num_hashfuncs,
+            m: bitset_size,
             n: 0,
-            murmur3_seeds: vec![1, 2, 3, 4, 5],
+            murmur3_seeds: (0..num_hashfuncs).step_by(1).collect(),
         }
     }
 
@@ -70,7 +98,7 @@ impl BloomFilter {
         let mut results: Vec<u128> = Vec::new();
 
         for seed in &self.murmur3_seeds {
-            results.push(hash(&item, *seed));
+            results.push(hash(&item, *seed as u32));
         }
 
         results
@@ -94,6 +122,18 @@ impl BloomFilter {
 
         exists
     }
+
+    pub fn error_rate(&self) -> f64 {
+        error_rate(self.m as i64, self.k as i64, self.n as i64)
+    }
+    
+    pub fn optimal_bitset_size(capacity: usize, false_positive_rate: f64) -> usize {
+        (-1.0 * (false_positive_rate.log(E) * capacity as f64) / (2.0_f64.log(E).powf(2.0))).ceil() as usize
+    }
+
+    pub fn hashfunctions_needed(bitset_size: usize, capacity: usize) -> usize {
+        ((bitset_size as f64 / capacity as f64) * 2.0_f64.log(E)).ceil() as usize
+    }
 }
 
 fn error_rate(filter_size: i64, num_hashfunctions: i64, num_elements: i64) -> f64 {
@@ -110,6 +150,9 @@ mod tests {
     use crate::hash;
     use crate::BloomFilter;
     use fasthash::murmur3;
+
+    use pyo3::prelude::*;
+    use pyo3::wrap_pyfunction;
 
     macro_rules! assert_delta {
         ($x:expr, $y:expr, $d:expr) => {
@@ -139,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_bloomfilter() {
-        let mut bf = BloomFilter::new(1024);
+        let mut bf = BloomFilter::new(1024, 0.01);
         bf.add("hello".as_bytes());
         bf.add("world".as_bytes());
         bf.add("sir".as_bytes());
@@ -149,5 +192,18 @@ mod tests {
         assert!(bf.check_existence("hello".as_bytes()));
         assert!(bf.check_existence("world".as_bytes()));
         assert!(!bf.check_existence("nonexistent".as_bytes()));
+    }
+
+    #[test]
+    fn test_size_optimization() {
+        let p = 0.01;
+        let n = 10_000_000;
+        let expected_k = 7;
+        let expected_m = 95_850_584;
+
+        let m = BloomFilter::optimal_bitset_size(n, p);
+        assert_eq!(m, expected_m);
+        let k = BloomFilter::hashfunctions_needed(m, n);
+        assert_eq!(k, expected_k);
     }
 }
